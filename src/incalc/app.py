@@ -18,7 +18,7 @@ from incalc.finance.installment_yield import Result, calculate
 FIELDS = [("price", "price"), ("months", "months"), ("capital", "capital"),
           ("monthly", "monthly %"), ("annual", "annual %"), ("tax", "tax %")]
 TOGGLE = len(FIELDS)
-TABLE_HEAD = f"{'month':>5}{'opening':>13}{'return':>11}{'payment':>12}{'closing':>13}"
+TABLE_HEAD = f"{'month':>5}{'opening':>13}{'return':>11}{'net paid':>12}{'redeemed':>12}{'tax':>10}{'closing':>13}"
 SIDE_BY_SIDE = len(TABLE_HEAD) + 48
 BOND_FIELDS = [("nominal", "nominal"), ("dirty_price", "dirty price"),
                ("days", "days left"), ("maturity", "maturity"),
@@ -35,7 +35,7 @@ def money(value: float) -> str:
 
 
 def row_text(row) -> str:
-    return f"{row.label:>5}{money(row.opening):>13}{money(row.earned):>11}{money(row.payment):>12}{money(row.closing):>13}"
+    return f"{row.label:>5}{money(row.opening):>13}{money(row.earned):>11}{money(row.payment):>12}{money(row.redeemed):>12}{money(row.withholding):>10}{money(row.closing):>13}"
 
 
 def as_number(text: str) -> float | None:
@@ -116,9 +116,11 @@ def draw_summary(win, y: int, result: Result | None, missing: str | None) -> int
         put(win, y, 2, f"needs {missing}", curses.A_DIM)
         return y + 2
     assert result is not None
-    lines = [("gross return", money(result.gross))]
-    if result.tax:
-        lines.extend((("tax", "-" + money(result.tax)), ("net return", money(result.net))))
+    lines = [("gross return", money(result.gross)),
+             ("total withholding", "-" + money(result.tax)),
+             ("net return", money(result.net))]
+    if result.final_withholding:
+        lines.append(("final fund tax", "-" + money(result.final_withholding)))
     if result.dry:
         lines.append(("out of pocket", money(-result.left)))
     elif result.surplus:

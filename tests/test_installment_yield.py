@@ -19,6 +19,25 @@ class InstallmentYieldTests(unittest.TestCase):
         self.assertEqual(result.rows[0].label, "now")
         self.assertEqual(result.rows[0].earned, 0)
 
+    def test_withholding_is_deducted_from_total_return(self):
+        result = calculate(price=1_200, months=12, monthly_percent=1, tax_percent=10)
+        self.assertGreater(result.tax, 0)
+        self.assertLess(result.tax, result.gross * 0.10)
+        self.assertAlmostEqual(result.net, result.gross - result.tax)
+
+    def test_withholding_is_taken_from_each_redemption_profit_share(self):
+        result = calculate(price=12_000, months=12, monthly_percent=1, tax_percent=10)
+        self.assertAlmostEqual(result.tax, sum(row.withholding for row in result.rows) + result.final_withholding)
+        self.assertGreater(result.rows[-1].withholding, result.rows[0].withholding)
+        self.assertAlmostEqual(result.rows[-1].redeemed, result.rows[-1].payment + result.rows[-1].withholding)
+        self.assertGreater(result.rows[-1].redeemed, result.rows[0].redeemed)
+        self.assertGreater(result.hold_net, result.left)
+
+    def test_final_fund_redemption_is_taxed(self):
+        result = calculate(price=12_000, months=12, monthly_percent=1, tax_percent=10)
+        self.assertGreater(result.final_withholding, 0)
+        self.assertAlmostEqual(result.net, result.gross - result.tax)
+
     def test_no_tool_flag_opens_the_selector(self):
         self.assertIsNone(parse_args([]).tool)
 
