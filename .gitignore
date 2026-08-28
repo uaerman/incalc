@@ -1,0 +1,22 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local Python environments and configuration
+.venv/
+venv/
+.env
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+
+# Nix local development outputs
+result
+result-*
+.direnv/
