@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "incalc"
+version = "0.1.0"
+description = "A cross-platform terminal toolbox for personal calculations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+incalc = "incalc.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/incalc"]
