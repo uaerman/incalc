@@ -24,7 +24,7 @@
             pythonImportsCheck = [ "incalc" "incalc.app" ];
 
             meta = {
-              description = "Cross-platform terminal toolbox for personal calculations";
+              description = "Terminal toolbox for personal calculations";
               mainProgram = "incalc";
             };
           };

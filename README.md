@@ -1,6 +1,6 @@
 # incalc
 
-`incalc` is a cross-platform terminal toolbox for small personal calculations.
+`incalc` is a terminal toolbox for small personal calculations.
 It starts with an interest-free installment-return calculator and is structured
 so further tools can be added without changing the app shell.
 
@@ -20,8 +20,22 @@ incalc --yield
 incalc --bond-yield
 incalc --real-return
 incalc --term-deposit
-incalc --tax
+incalc --profit-margin
+incalc --average-cost
+incalc --average-maturity
 ```
+
+## Average Cost and Average Maturity
+
+Both tools add a new blank entry whenever the current one is completed.
+Average Cost weights each purchase price by quantity. Average Maturity weights
+each remaining-day value by its amount.
+
+## Profit Margin
+
+Enter unit cost, sale price, and quantity. The tool separates profit margin
+(profit divided by sale price) from markup (profit divided by cost), alongside
+unit and total profit.
 
 ## Term Deposit Interest
 
@@ -37,14 +51,16 @@ your purchasing power increased or decreased.
 
 ## Bond & Note Yield
 
-Enter the nominal amount, dirty purchase price per 100 nominal, and either a
+Enter the nominal amount and dirty purchase price. A three-digit quote (such
+as `100.50`) is treated as a price per 100 nominal; a smaller quote (such as
+`1.005`) is treated as a price per one nominal. Then enter either a
 per-payment coupon rate or annual coupon rate; the other rate is filled from
 the selected coupon frequency. Also enter either remaining days or a
 `DD-MM-YYYY` maturity date. The other maturity field is filled from today's
 date. Select annual, semiannual, or quarterly coupon payments with Space.
 Results use ACT/365 and show total cost, cash flows, principal, total gain,
-annualized compound return, and maturity yield (the annual rate that discounts
-all future cash flows to today's dirty price).
+and compound yield (the annual rate that discounts all future cash flows to
+today's dirty price).
 
 The interface uses the terminal-native `curses` UI: arrow keys move between
 fields, Space toggles the first-payment timing, and Page Up/Page Down scroll

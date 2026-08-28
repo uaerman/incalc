@@ -12,6 +12,8 @@ from typing import Callable
 from incalc.finance import bond_yield
 from incalc.finance import real_return
 from incalc.finance import term_deposit
+from incalc.finance import profit_margin
+from incalc.finance import weighted_average
 from incalc.finance.installment_yield import Result, calculate
 
 
@@ -28,6 +30,7 @@ BOND_FREQUENCY_OPTIONS = tuple(bond_yield.FREQUENCIES)
 REAL_RETURN_FIELDS = [("nominal", "nominal %"), ("inflation", "inflation %"), ("tax", "tax %")]
 REAL_RETURN_TOGGLE = len(REAL_RETURN_FIELDS)
 TERM_DEPOSIT_FIELDS = [("principal", "principal"), ("annual_rate", "annual %"), ("days", "term days")]
+PROFIT_MARGIN_FIELDS = [("cost", "unit cost"), ("price", "sale price"), ("quantity", "quantity")]
 
 
 def money(value: float) -> str:
@@ -174,6 +177,7 @@ def prepare_terminal(win) -> None:
 class Tool:
     flag: str
     label: str
+    category: str
     description: str
     run: Callable[[curses.window], str]
 
@@ -293,10 +297,10 @@ def draw_bond_summary(win, y: int, result, missing: str | None) -> int:
         return y + 2
     lines = (("total cost", money(result.total_cost)), ("coupons", money(result.total_coupons)),
              ("principal", money(result.principal_at_maturity)), ("total gain", money(result.total_gain)),
-             ("annualized", f"{result.annualized_return:.2f}%"), ("maturity yield", f"{result.ytm:.2f}%"))
+             ("compound yield", f"{result.ytm:.2f}%"))
     for index, (label, value) in enumerate(lines):
         put(win, y + index, 2, label.rjust(13), curses.A_DIM)
-        put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label == "maturity yield" else 0)
+        put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label == "compound yield" else 0)
     return y + len(lines) + 1
 
 
@@ -494,29 +498,162 @@ def term_deposit_calculator(win) -> str:
             state[TERM_DEPOSIT_FIELDS[cursor][0]] += chr(key)
 
 
-def tax_placeholder(win) -> str:
-    win.erase()
-    put(win, 1, 2, "incalc · tax", curses.color_pair(1) | curses.A_BOLD)
-    put(win, 3, 2, "The tax calculator has not been implemented yet.")
-    put(win, 5, 2, "Its flag and menu entry are ready: incalc --tax", curses.A_DIM)
-    put(win, win.getmaxyx()[0] - 1, 2, "m/← tools  esc/q quit", curses.A_DIM)
-    win.refresh()
+def profit_margin_result(state: dict[str, str]):
+    cost = as_number(state["cost"])
+    price = as_number(state["price"])
+    quantity = as_number(state["quantity"])
+    if cost is None:
+        return None, "a unit cost"
+    if price is None:
+        return None, "a sale price"
+    if quantity is None:
+        return None, "a quantity"
+    try:
+        return profit_margin.calculate(unit_cost=cost, unit_price=price, quantity=quantity), None
+    except ValueError as error:
+        return None, str(error)
+
+
+def profit_margin_calculator(win) -> str:
+    state = {key: "" for key, _ in PROFIT_MARGIN_FIELDS}
+    cursor = 0
     while True:
+        result, missing = profit_margin_result(state)
+        win.erase()
+        put(win, 0, 2, "incalc · profit margin", curses.color_pair(1) | curses.A_BOLD)
+        for index, (key, label) in enumerate(PROFIT_MARGIN_FIELDS):
+            y, value = 2 + index, state[key]
+            put(win, y, 2, label.rjust(11), curses.A_DIM)
+            shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
+            if index == cursor:
+                shown, attr = (value or " ") + " ", curses.A_REVERSE
+            put(win, y, 15, f" {shown} ", attr)
+        y = 7
+        if missing:
+            put(win, y, 2, f"needs {missing}", curses.A_DIM)
+        else:
+            lines = (("unit profit", money(result.unit_profit)), ("total cost", money(result.total_cost)),
+                     ("revenue", money(result.total_revenue)), ("total profit", money(result.total_profit)),
+                     ("profit margin", f"{result.profit_margin:.2f}%"), ("markup", f"{result.markup:.2f}%"))
+            for index, (label, value) in enumerate(lines):
+                put(win, y + index, 2, label.rjust(13), curses.A_DIM)
+                put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label in ("profit margin", "markup") else 0)
+        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  m/← tools  esc/q quit", curses.A_DIM)
+        win.refresh()
         key = win.getch()
-        if key == ord("q"):
+        if key == ord("q") or key == 27:
             return "quit"
-        if key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT, curses.KEY_ENTER, ord("\n")):
+        if key in (ord("m"), curses.KEY_LEFT):
             return "menu"
+        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
+            cursor = (cursor + 1) % len(PROFIT_MARGIN_FIELDS)
+        elif key in (curses.KEY_UP, curses.KEY_BTAB):
+            cursor = (cursor - 1) % len(PROFIT_MARGIN_FIELDS)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            state[PROFIT_MARGIN_FIELDS[cursor][0]] = state[PROFIT_MARGIN_FIELDS[cursor][0]][:-1]
+        elif 0 <= key < 256 and chr(key) in "0123456789.-":
+            state[PROFIT_MARGIN_FIELDS[cursor][0]] += chr(key)
+
+
+def average_entries(rows: list[dict[str, str]], left: str, right: str):
+    entries: list[tuple[float, float]] = []
+    for index, row in enumerate(rows, start=1):
+        first, second = row[left].strip(), row[right].strip()
+        if not first and not second:
+            continue
+        first_value, second_value = as_number(first), as_number(second)
+        if first_value is None or second_value is None:
+            return None, f"both values for entry {index}"
+        entries.append((first_value, second_value))
+    if not entries:
+        return None, "at least one entry"
+    return entries, None
+
+
+def weighted_average_calculator(win, *, title: str, left: str, right: str, calculate) -> str:
+    rows = [{left: "", right: ""}]
+    cursor, top_row = 0, 0
+    while True:
+        entries, missing = average_entries(rows, left, right)
+        if entries is not None:
+            try:
+                result, missing = calculate(entries), None
+            except ValueError as error:
+                result, missing = None, str(error)
+        else:
+            result = None
+        win.erase()
+        put(win, 0, 2, f"incalc · {title}", curses.color_pair(1) | curses.A_BOLD)
+        current_row = cursor // 2
+        visible_rows = max(1, (win.getmaxyx()[0] - 10) // 2)
+        if current_row < top_row:
+            top_row = current_row
+        elif current_row >= top_row + visible_rows:
+            top_row = current_row - visible_rows + 1
+        for row_index in range(top_row, min(len(rows), top_row + visible_rows)):
+            y = 2 + (row_index - top_row) * 2
+            for side, key in enumerate((left, right)):
+                value = rows[row_index][key]
+                put(win, y + side, 2, f"{key} {row_index + 1}".rjust(11), curses.A_DIM)
+                shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
+                if cursor == row_index * 2 + side:
+                    shown, attr = (value or " ") + " ", curses.A_REVERSE
+                put(win, y + side, 15, f" {shown} ", attr)
+        y = 2 + min(visible_rows, len(rows) - top_row) * 2 + 1
+        if top_row:
+            put(win, 1, 45, f"entries {top_row + 1}-{min(len(rows), top_row + visible_rows)}", curses.A_DIM)
+        if missing:
+            put(win, y, 2, f"needs {missing}", curses.A_DIM)
+        elif title == "average cost":
+            lines = (("total quantity", money(result.total_quantity)), ("total cost", money(result.total_cost)),
+                     ("average cost", money(result.average_cost)))
+            for index, (label, value) in enumerate(lines):
+                put(win, y + index, 2, label.rjust(13), curses.A_DIM)
+                put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label == "average cost" else 0)
+        else:
+            put(win, y, 2, "total amount".rjust(13), curses.A_DIM)
+            put(win, y, 16, money(result.total_amount).rjust(13))
+            put(win, y + 1, 2, "average days".rjust(13), curses.A_DIM)
+            put(win, y + 1, 16, f"{result.average_days:.2f}".rjust(13), curses.A_BOLD)
+        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  new row opens automatically  m/← tools  esc/q quit", curses.A_DIM)
+        win.refresh()
+        key = win.getch()
+        if key == ord("q") or key == 27:
+            return "quit"
+        if key in (ord("m"), curses.KEY_LEFT):
+            return "menu"
+        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
+            cursor = (cursor + 1) % (len(rows) * 2)
+        elif key in (curses.KEY_UP, curses.KEY_BTAB):
+            cursor = (cursor - 1) % (len(rows) * 2)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            row, key_name = rows[cursor // 2], (left, right)[cursor % 2]
+            row[key_name] = row[key_name][:-1]
+        elif 0 <= key < 256 and chr(key) in "0123456789.":
+            row, key_name = rows[cursor // 2], (left, right)[cursor % 2]
+            row[key_name] += chr(key)
+            if rows[-1][left] and rows[-1][right]:
+                rows.append({left: "", right: ""})
+
+
+def average_cost_calculator(win) -> str:
+    return weighted_average_calculator(win, title="average cost", left="quantity", right="price",
+                                       calculate=weighted_average.average_cost)
+
+
+def average_maturity_calculator(win) -> str:
+    return weighted_average_calculator(win, title="average maturity", left="amount", right="days",
+                                       calculate=weighted_average.average_maturity)
 
 
 TOOLS = (
-    Tool("yield", "Installment yield", "Interest-free installments and fund return", calculator),
-    Tool("bond-yield", "Bond & Note Yield", "Cash flows, annualized return, and maturity yield", bond_calculator),
-    Tool("real-return", "Real Return", "After-tax return adjusted for inflation", real_return_calculator),
-    Tool("term-deposit", "Term Deposit Interest", "Net interest and maturity comparison", term_deposit_calculator),
-    Tool("tax", "Tax calculator", "Coming soon", tax_placeholder),
+    Tool("yield", "Installment yield", "Savings & Returns", "Interest-free installments and fund return", calculator),
+    Tool("real-return", "Real Return", "Savings & Returns", "After-tax return adjusted for inflation", real_return_calculator),
+    Tool("term-deposit", "Term Deposit Interest", "Savings & Returns", "Net interest and maturity comparison", term_deposit_calculator),
+    Tool("bond-yield", "Bond & Note Yield", "Bonds & Securities", "Cash flows and compound yield", bond_calculator),
+    Tool("profit-margin", "Profit Margin", "Business", "Compare margin and markup from cost and sale price", profit_margin_calculator),
+    Tool("average-cost", "Average Cost", "Portfolio", "", average_cost_calculator),
+    Tool("average-maturity", "Average Maturity", "Portfolio", "", average_maturity_calculator),
 )
 
 
@@ -524,7 +661,7 @@ def search_tools(query: str) -> tuple[Tool, ...]:
     needle = query.casefold().strip()
     if not needle:
         return TOOLS
-    return tuple(tool for tool in TOOLS if needle in f"{tool.label} {tool.description} {tool.flag}".casefold())
+    return tuple(tool for tool in TOOLS if needle in f"{tool.category} {tool.label} {tool.description} {tool.flag}".casefold())
 
 
 def tools_menu(win, selected_tool: str | None = None) -> str | None:
@@ -536,10 +673,18 @@ def tools_menu(win, selected_tool: str | None = None) -> str | None:
         win.erase()
         put(win, 1, 2, "incalc · tools", curses.color_pair(1) | curses.A_BOLD)
         put(win, 3, 2, f" search: {query or 'type to filter'} ", curses.A_REVERSE if query else curses.A_DIM)
-        for index, tool in enumerate(visible_tools):
-            attr = curses.A_REVERSE if index == cursor else curses.A_NORMAL
-            put(win, 5 + index * 2, 4, f"{tool.label:<22} {tool.description}", attr)
-            put(win, 5 + index * 2, 2, "›" if index == cursor else " ", attr)
+        y = 5
+        for category in dict.fromkeys(tool.category for tool in visible_tools):
+            put(win, y, 2, category.upper(), curses.A_DIM | curses.A_BOLD)
+            y += 1
+            for tool in (item for item in visible_tools if item.category == category):
+                index = visible_tools.index(tool)
+                attr = curses.A_REVERSE if index == cursor else curses.A_NORMAL
+                text = tool.label if not tool.description else f"{tool.label:<22} {tool.description}"
+                put(win, y, 4, text, attr)
+                put(win, y, 2, "›" if index == cursor else " ", attr)
+                y += 1
+            y += 1
         if not visible_tools:
             put(win, 5, 2, "no matching tools", curses.A_DIM)
         put(win, win.getmaxyx()[0] - 1, 2, "type search  ctrl+u clear  ↑/↓ select  enter/→ open  esc/q quit", curses.A_DIM)
@@ -589,14 +734,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     tool = parser.add_mutually_exclusive_group()
     tool.add_argument("--yield", dest="tool", action="store_const", const="yield",
                       help="open installment yield directly")
-    tool.add_argument("--tax", dest="tool", action="store_const", const="tax",
-                      help="open tax calculator directly")
     tool.add_argument("--bond-yield", dest="tool", action="store_const", const="bond-yield",
                       help="open bond and note yield directly")
     tool.add_argument("--real-return", dest="tool", action="store_const", const="real-return",
                       help="open real return directly")
     tool.add_argument("--term-deposit", dest="tool", action="store_const", const="term-deposit",
                       help="open term deposit interest directly")
+    tool.add_argument("--profit-margin", dest="tool", action="store_const", const="profit-margin",
+                      help="open profit margin directly")
+    tool.add_argument("--average-cost", dest="tool", action="store_const", const="average-cost",
+                      help="open average cost directly")
+    tool.add_argument("--average-maturity", dest="tool", action="store_const", const="average-maturity",
+                      help="open average maturity directly")
     return parser.parse_args(argv)
 
 

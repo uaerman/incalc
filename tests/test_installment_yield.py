@@ -43,10 +43,12 @@ class InstallmentYieldTests(unittest.TestCase):
 
     def test_tool_flags_select_their_tools(self):
         self.assertEqual(parse_args(["--yield"]).tool, "yield")
-        self.assertEqual(parse_args(["--tax"]).tool, "tax")
         self.assertEqual(parse_args(["--bond-yield"]).tool, "bond-yield")
         self.assertEqual(parse_args(["--real-return"]).tool, "real-return")
         self.assertEqual(parse_args(["--term-deposit"]).tool, "term-deposit")
+        self.assertEqual(parse_args(["--profit-margin"]).tool, "profit-margin")
+        self.assertEqual(parse_args(["--average-cost"]).tool, "average-cost")
+        self.assertEqual(parse_args(["--average-maturity"]).tool, "average-maturity")
 
     def test_ctrl_c_exits_without_a_traceback(self):
         with patch("incalc.app.curses.wrapper", side_effect=KeyboardInterrupt):

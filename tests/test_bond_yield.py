@@ -9,7 +9,7 @@ class BondYieldTests(unittest.TestCase):
     def test_zero_coupon_bond_yield(self):
         result = calculate(
             nominal=100,
-            dirty_price=95,
+            dirty_price=0.95,
             maturity=date(2027, 1, 1),
             coupon_rate=0,
             frequency=1,
@@ -17,8 +17,19 @@ class BondYieldTests(unittest.TestCase):
         )
         self.assertEqual(result.total_cost, 95)
         self.assertEqual(result.principal_at_maturity, 100)
-        self.assertAlmostEqual(result.annualized_return, 100 / 95 * 100 - 100, places=8)
         self.assertAlmostEqual(result.ytm, 100 / 95 * 100 - 100, places=8)
+
+    def test_dirty_price_quote_is_normalized_by_its_digits(self):
+        quoted_per_hundred = calculate(
+            nominal=100, dirty_price=100.5, maturity=date(2027, 1, 1),
+            coupon_rate=0, frequency=1, settlement=date(2026, 1, 1),
+        )
+        quoted_per_nominal = calculate(
+            nominal=100, dirty_price=1.005, maturity=date(2027, 1, 1),
+            coupon_rate=0, frequency=1, settlement=date(2026, 1, 1),
+        )
+        self.assertAlmostEqual(quoted_per_hundred.total_cost, 100.5)
+        self.assertAlmostEqual(quoted_per_nominal.total_cost, 100.5)
 
     def test_semiannual_coupon_dates_are_generated_back_from_maturity(self):
         dates = coupon_dates(date(2026, 1, 1), date(2027, 1, 1), 2)

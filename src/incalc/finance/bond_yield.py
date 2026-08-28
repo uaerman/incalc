@@ -28,7 +28,6 @@ class BondResult:
     total_coupons: float
     principal_at_maturity: float
     total_gain: float
-    annualized_return: float
     ytm: float
 
 
@@ -64,17 +63,18 @@ def calculate(
     if maturity <= settlement:
         raise ValueError("maturity must be after settlement")
 
-    total_cost = nominal * dirty_price / 100
+    # Three-digit quotes (for example 100.50) are prices per 100 nominal.
+    # Smaller quotes (for example 1.005) are already per one nominal.
+    unit_price = dirty_price / 100 if 100 <= dirty_price < 1_000 else dirty_price
+    total_cost = nominal * unit_price
     period_coupon = nominal * coupon_rate / 100 / frequency
     dates = coupon_dates(settlement, maturity, frequency)
     flows = [CashFlow(day, period_coupon, nominal if day == maturity else 0) for day in dates]
     total_coupons = sum(flow.coupon for flow in flows)
     principal = nominal
     total_gain = total_coupons + principal - total_cost
-    years = (maturity - settlement).days / 365
-    annualized_return = ((total_coupons + principal) / total_cost) ** (1 / years) * 100 - 100
     ytm = yield_to_maturity(total_cost, flows, settlement) * 100
-    return BondResult(total_cost, flows, total_coupons, principal, total_gain, annualized_return, ytm)
+    return BondResult(total_cost, flows, total_coupons, principal, total_gain, ytm)
 
 
 def yield_to_maturity(price: float, flows: list[CashFlow], settlement: date) -> float:
