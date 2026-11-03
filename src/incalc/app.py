@@ -1,44 +1,47 @@
-"""Keyboard-first curses interface for inCalc."""
+"""Keyboard-first curses interface for inCalc.
+
+Every tool is a ``Form``: a list of input fields, an optional toggle, and
+methods that turn the field text into a result, summary lines, and an optional
+table. ``run_form`` owns drawing and key handling for all of them, so adding a
+tool means writing a ``Form`` subclass and one ``Tool`` entry.
+"""
 
 from __future__ import annotations
 
 import argparse
 import curses
 import locale
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable
 
 from incalc.finance import bond_yield
+from incalc.finance import installment_yield
+from incalc.finance import profit_margin
 from incalc.finance import real_return
 from incalc.finance import term_deposit
-from incalc.finance import profit_margin
 from incalc.finance import weighted_average
-from incalc.finance.installment_yield import Result, calculate
 
 
-FIELDS = [("price", "price"), ("months", "months"), ("capital", "capital"),
-          ("monthly", "monthly %"), ("annual", "annual %"), ("tax", "tax %")]
-TOGGLE = len(FIELDS)
-TABLE_HEAD = f"{'month':>5}{'opening':>13}{'return':>11}{'net paid':>12}{'redeemed':>12}{'tax':>10}{'closing':>13}"
-SIDE_BY_SIDE = len(TABLE_HEAD) + 48
-BOND_FIELDS = [("nominal", "nominal"), ("dirty_price", "dirty price"),
-               ("days", "days left"), ("maturity", "maturity"),
-               ("coupon_rate", "coupon %"), ("annual_rate", "annual %")]
-BOND_FREQUENCY = len(BOND_FIELDS)
-BOND_FREQUENCY_OPTIONS = tuple(bond_yield.FREQUENCIES)
-REAL_RETURN_FIELDS = [("nominal", "nominal %"), ("inflation", "inflation %"), ("tax", "tax %")]
-REAL_RETURN_TOGGLE = len(REAL_RETURN_FIELDS)
-TERM_DEPOSIT_FIELDS = [("principal", "principal"), ("annual_rate", "annual %"), ("days", "term days")]
-PROFIT_MARGIN_FIELDS = [("cost", "unit cost"), ("price", "sale price"), ("quantity", "quantity")]
+DIGITS = "0123456789"
+NUMBER = DIGITS + "."
+SIGNED = NUMBER + "-"
+DATE = DIGITS + "-"
+
+NEXT_KEYS = (curses.KEY_DOWN, curses.KEY_ENTER, ord("\t"), ord("\n"))
+PREV_KEYS = (curses.KEY_UP, curses.KEY_BTAB)
+BACKSPACE_KEYS = (curses.KEY_BACKSPACE, 127, 8)
+QUIT_KEYS = (ord("q"), 27)
+MENU_KEYS = (ord("m"), curses.KEY_LEFT)
+
+LABEL_X, VALUE_X, LABEL_WIDTH = 2, 15, 11
+SUMMARY_LABEL_X, SUMMARY_LABEL_WIDTH = 2, 17
+SUMMARY_VALUE_X, SUMMARY_WIDTH = 20, 13
 
 
 def money(value: float) -> str:
     return f"{value:,.2f}"
-
-
-def row_text(row) -> str:
-    return f"{row.label:>5}{money(row.opening):>13}{money(row.earned):>11}{money(row.payment):>12}{money(row.redeemed):>12}{money(row.withholding):>10}{money(row.closing):>13}"
 
 
 def as_number(text: str) -> float | None:
@@ -48,7 +51,218 @@ def as_number(text: str) -> float | None:
         return None
 
 
-def state_result(state: dict[str, str], pay_now: bool) -> tuple[Result | None, str | None]:
+def put(win, y: int, x: int, text: str, attr: int = 0) -> None:
+    height, width = win.getmaxyx()
+    if not 0 <= y < height or not 0 <= x < width:
+        return
+    try:
+        win.addstr(y, x, text[: width - x - 1], attr)
+    except curses.error:
+        pass
+
+
+def accent() -> int:
+    return curses.color_pair(1)
+
+
+def warning() -> int:
+    return curses.color_pair(2)
+
+
+# --------------------------------------------------------------------------
+# Form framework
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Field:
+    key: str
+    label: str
+    chars: str = NUMBER
+    placeholder: str = "-"
+
+
+@dataclass(frozen=True)
+class Line:
+    """One summary row: a right-aligned label and value, or a free-text note."""
+    label: str = ""
+    value: str = ""
+    attr: int = 0
+    note: bool = False
+
+
+@dataclass(frozen=True)
+class Table:
+    head: str
+    rows: list[str]
+    caption: str | None = None
+
+
+class Form:
+    title = ""
+    fields: tuple[Field, ...] = ()
+    toggle_label: str | None = None
+    toggle_hint = "toggle"
+    hint = ""
+    table_x: int | None = None  # column for a side-by-side table on wide terminals
+
+    def __init__(self) -> None:
+        self.state = {field.key: "" for field in self.visible_fields()}
+
+    def visible_fields(self) -> tuple[Field, ...]:
+        return self.fields
+
+    def evaluate(self) -> tuple[object | None, str | None]:
+        raise NotImplementedError
+
+    def summary(self, result) -> list[Line]:
+        return []
+
+    def table(self, result) -> Table | None:
+        return None
+
+    def toggle_text(self) -> str:
+        return ""
+
+    def on_toggle(self) -> None:
+        pass
+
+    def on_edit(self, key: str, typed: str | None) -> None:
+        """Called after a field changes; ``typed`` is None for a backspace."""
+
+
+def draw_table(win, top: int, left: int, table: Table, scroll: int) -> int:
+    if table.caption:
+        put(win, top, left, table.caption, curses.A_DIM)
+        top += 1
+    room = win.getmaxyx()[0] - top - 2
+    if room < 3:
+        return 0
+    body = max(1, room - 2)
+    scroll = max(0, min(scroll, len(table.rows) - body))
+    put(win, top, left, table.head, curses.A_DIM)
+    put(win, top + 1, left, "-" * len(table.head), curses.A_DIM)
+    for index, row in enumerate(table.rows[scroll:scroll + body]):
+        put(win, top + 2 + index, left, row)
+    if len(table.rows) > body:
+        put(win, top + body + 2, left, f"{scroll + 1}-{scroll + body} of {len(table.rows)}   pgup/pgdn", curses.A_DIM)
+    return scroll
+
+
+def draw_summary(win, y: int, lines: list[Line]) -> int:
+    for line in lines:
+        if line.note:
+            put(win, y, SUMMARY_LABEL_X, line.value, line.attr)
+        elif line.label or line.value:
+            put(win, y, SUMMARY_LABEL_X, line.label.rjust(SUMMARY_LABEL_WIDTH), curses.A_DIM)
+            put(win, y, SUMMARY_VALUE_X, line.value.rjust(SUMMARY_WIDTH), line.attr)
+        y += 1
+    return y
+
+
+def footer(form: Form, has_table: bool) -> str:
+    parts = ["↑/↓ field"]
+    if form.toggle_label:
+        parts.append(f"space {form.toggle_hint}")
+    if has_table:
+        parts.append("pgup/pgdn table")
+    if form.hint:
+        parts.append(form.hint)
+    parts += ["m/← tools", "esc/q quit"]
+    return "  ".join(parts)
+
+
+def run_form(win, form: Form) -> str:
+    cursor = scroll = top = 0
+    while True:
+        fields = form.visible_fields()
+        positions = len(fields) + (1 if form.toggle_label else 0)
+        cursor %= positions
+        result, missing = form.evaluate()
+        height, width = win.getmaxyx()
+        win.erase()
+        put(win, 0, 2, f"incalc · {form.title}", accent() | curses.A_BOLD)
+
+        room = max(1, height - 10)
+        if cursor < len(fields):
+            top = min(top, cursor)
+            top = max(top, cursor - room + 1)
+        top = max(0, min(top, len(fields) - room))
+        y = 2
+        for index in range(top, min(len(fields), top + room)):
+            field = fields[index]
+            value = form.state[field.key]
+            put(win, y, LABEL_X, field.label.rjust(LABEL_WIDTH), curses.A_DIM)
+            if index == cursor:
+                shown, attr = (value or " ") + " ", curses.A_REVERSE
+            elif value:
+                shown, attr = value, curses.A_NORMAL
+            else:
+                shown, attr = field.placeholder, curses.A_DIM
+            put(win, y, VALUE_X, f" {shown} ", attr)
+            y += 1
+        if len(fields) > room:
+            put(win, 1, LABEL_X, f"fields {top + 1}-{min(len(fields), top + room)} of {len(fields)}", curses.A_DIM)
+        if form.toggle_label:
+            put(win, y, LABEL_X, form.toggle_label.rjust(LABEL_WIDTH), curses.A_DIM)
+            attr = curses.A_REVERSE if cursor == len(fields) else curses.A_NORMAL
+            put(win, y, VALUE_X, f" {form.toggle_text()} ", attr)
+            y += 1
+        y += 1
+
+        if missing:
+            put(win, y, SUMMARY_LABEL_X, f"needs {missing}", curses.A_DIM)
+            y += 2
+        else:
+            y = draw_summary(win, y, form.summary(result)) + 1
+
+        table = form.table(result) if result is not None else None
+        if table is not None:
+            if form.table_x is not None and width >= form.table_x + len(table.head) + 2:
+                scroll = draw_table(win, 1, form.table_x, table, scroll)
+            else:
+                scroll = draw_table(win, y, 2, table, scroll)
+        put(win, height - 1, 2, footer(form, form.table_x is not None), curses.A_DIM)
+        win.refresh()
+
+        key = win.getch()
+        if key in QUIT_KEYS:
+            return "quit"
+        if key in MENU_KEYS:
+            return "menu"
+        if key in NEXT_KEYS:
+            cursor = (cursor + 1) % positions
+        elif key in PREV_KEYS:
+            cursor = (cursor - 1) % positions
+        elif key == curses.KEY_NPAGE:
+            scroll += 5
+        elif key == curses.KEY_PPAGE:
+            scroll = max(0, scroll - 5)
+        elif cursor == len(fields):
+            if key == ord(" "):
+                form.on_toggle()
+        elif key in BACKSPACE_KEYS:
+            name = fields[cursor].key
+            form.state[name] = form.state[name][:-1]
+            form.on_edit(name, None)
+        elif 0 <= key < 256 and chr(key) in fields[cursor].chars:
+            name = fields[cursor].key
+            form.state[name] += chr(key)
+            form.on_edit(name, chr(key))
+
+
+# --------------------------------------------------------------------------
+# Installment yield
+# --------------------------------------------------------------------------
+
+INSTALLMENT_HEAD = f"{'month':>5}{'opening':>13}{'return':>11}{'net paid':>12}{'redeemed':>12}{'tax':>10}{'closing':>13}"
+
+
+def row_text(row: installment_yield.Period) -> str:
+    return (f"{row.label:>5}{money(row.opening):>13}{money(row.earned):>11}{money(row.payment):>12}"
+            f"{money(row.redeemed):>12}{money(row.withholding):>10}{money(row.closing):>13}")
+
+
+def state_result(state: dict[str, str], pay_now: bool) -> tuple[installment_yield.Result | None, str | None]:
     price, months = as_number(state["price"]), as_number(state["months"])
     if price is None or price <= 0:
         return None, "a price to start with"
@@ -74,155 +288,60 @@ def state_result(state: dict[str, str], pay_now: bool) -> tuple[Result | None, s
     if tax is None or not 0 <= tax < 100:
         return None, "a tax between 0 and 100"
     try:
-        return calculate(price=price, months=int(months), capital=capital,
-                         monthly_percent=monthly, annual_percent=annual,
-                         tax_percent=tax, pay_now=pay_now), None
+        return installment_yield.calculate(price=price, months=int(months), capital=capital,
+                                           monthly_percent=monthly, annual_percent=annual,
+                                           tax_percent=tax, pay_now=pay_now), None
     except ValueError as error:
         return None, str(error)
 
 
-def put(win, y: int, x: int, text: str, attr: int = 0) -> None:
-    height, width = win.getmaxyx()
-    if not 0 <= y < height or not 0 <= x < width:
-        return
-    try:
-        win.addstr(y, x, text[: width - x - 1], attr)
-    except curses.error:
-        pass
+class InstallmentForm(Form):
+    title = "installment yield"
+    fields = (Field("price", "price"), Field("months", "months", DIGITS),
+              Field("capital", "capital", placeholder="= price"), Field("monthly", "monthly %"),
+              Field("annual", "annual %"), Field("tax", "tax %", placeholder="0"))
+    toggle_label = "first due"
+    table_x = 44
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pay_now = False
+
+    def evaluate(self):
+        return state_result(self.state, self.pay_now)
+
+    def toggle_text(self) -> str:
+        return "at purchase" if self.pay_now else "in a month"
+
+    def on_toggle(self) -> None:
+        self.pay_now = not self.pay_now
+
+    def on_edit(self, key: str, typed: str | None) -> None:
+        # Monthly and annual returns are alternatives; typing one clears the other.
+        if typed is not None and key in ("monthly", "annual"):
+            self.state["annual" if key == "monthly" else "monthly"] = ""
+
+    def summary(self, result) -> list[Line]:
+        lines = [Line("gross return", money(result.gross)),
+                 Line("total withholding", "-" + money(result.tax)),
+                 Line("net return", money(result.net))]
+        if result.final_withholding:
+            lines.append(Line("final fund tax", "-" + money(result.final_withholding)))
+        if result.dry:
+            return lines + [Line("out of pocket", money(-result.left)), Line(),
+                            Line(value="fund runs dry, rest is out of pocket", attr=warning(), note=True)]
+        if result.surplus:
+            lines += [Line("left in fund", money(result.left)), Line("from the plan", money(result.plan_net))]
+        return lines + [Line("you paid", money(result.paid), curses.A_BOLD),
+                        Line(value=f"{result.discount_percent:.2f}% off the price", attr=accent())]
+
+    def table(self, result) -> Table:
+        return Table(INSTALLMENT_HEAD, [row_text(row) for row in result.rows])
 
 
-def draw_form(win, state: dict[str, str], cursor: int, pay_now: bool) -> int:
-    put(win, 0, 2, "incalc · installment yield", curses.color_pair(1) | curses.A_BOLD)
-    for index, (key, label) in enumerate(FIELDS):
-        y, value = 2 + index, state[key]
-        put(win, y, 2, label.rjust(9), curses.A_DIM)
-        if not value and key == "capital":
-            shown, attr = "= price", curses.A_DIM
-        elif not value and key == "tax":
-            shown, attr = "0", curses.A_DIM
-        elif not value:
-            shown, attr = "-", curses.A_DIM
-        else:
-            shown, attr = value, curses.A_NORMAL
-        if index == cursor:
-            shown, attr = (value or " ") + " ", curses.A_REVERSE
-        put(win, y, 12, f" {shown} ", attr)
-    y = 2 + TOGGLE
-    put(win, y, 2, "first due".rjust(9), curses.A_DIM)
-    text = "at purchase" if pay_now else "in a month"
-    put(win, y, 12, f" {text} ", curses.A_REVERSE if cursor == TOGGLE else curses.A_NORMAL)
-    return y + 2
-
-
-def draw_summary(win, y: int, result: Result | None, missing: str | None) -> int:
-    if missing:
-        put(win, y, 2, f"needs {missing}", curses.A_DIM)
-        return y + 2
-    assert result is not None
-    lines = [("gross return", money(result.gross)),
-             ("total withholding", "-" + money(result.tax)),
-             ("net return", money(result.net))]
-    if result.final_withholding:
-        lines.append(("final fund tax", "-" + money(result.final_withholding)))
-    if result.dry:
-        lines.append(("out of pocket", money(-result.left)))
-    elif result.surplus:
-        lines.extend((("left in fund", money(result.left)), ("from the plan", money(result.plan_net))))
-    for index, (label, value) in enumerate(lines):
-        put(win, y + index, 2, label.rjust(13), curses.A_DIM)
-        put(win, y + index, 16, value.rjust(13))
-    y += len(lines)
-    if result.dry:
-        put(win, y + 1, 2, "fund runs dry, rest is out of pocket", curses.color_pair(2))
-        return y + 3
-    put(win, y, 2, "you paid".rjust(13), curses.A_DIM)
-    put(win, y, 16, money(result.paid).rjust(13), curses.A_BOLD)
-    put(win, y + 1, 16, f"{result.discount_percent:.2f}% off the price", curses.color_pair(1))
-    return y + 3
-
-
-def draw_table(win, top: int, left: int, result: Result | None, scroll: int) -> int:
-    room = win.getmaxyx()[0] - top - 2
-    if result is None or room < 3:
-        return 0
-    body = max(1, room - 2)
-    scroll = max(0, min(scroll, len(result.rows) - body))
-    put(win, top, left, TABLE_HEAD, curses.A_DIM)
-    put(win, top + 1, left, "-" * len(TABLE_HEAD), curses.A_DIM)
-    for index, row in enumerate(result.rows[scroll:scroll + body]):
-        put(win, top + 2 + index, left, row_text(row))
-    if len(result.rows) > body:
-        put(win, top + body + 2, left, f"{scroll + 1}-{scroll + body} of {len(result.rows)}   pgup/pgdn", curses.A_DIM)
-    return scroll
-
-
-def prepare_terminal(win) -> None:
-    # Translate terminal escape sequences (such as arrows) into KEY_* codes.
-    # Without this, an Up arrow can be read as a bare Escape on some terminals.
-    win.keypad(True)
-    try:
-        curses.curs_set(0)
-    except curses.error:
-        pass
-    try:
-        curses.use_default_colors()
-    except curses.error:
-        pass
-    for pair, colour in ((1, curses.COLOR_CYAN), (2, curses.COLOR_RED)):
-        try:
-            curses.init_pair(pair, colour, -1)
-        except curses.error:
-            pass
-@dataclass(frozen=True)
-class Tool:
-    flag: str
-    label: str
-    category: str
-    description: str
-    run: Callable[[curses.window], str]
-
-
-def calculator(win) -> str:
-    state = {key: "" for key, _ in FIELDS}
-    cursor, scroll, pay_now = 0, 0, False
-    while True:
-        result, missing = state_result(state, pay_now)
-        win.erase()
-        after_form = draw_form(win, state, cursor, pay_now)
-        after_summary = draw_summary(win, after_form, result, missing)
-        if win.getmaxyx()[1] >= SIDE_BY_SIDE:
-            scroll = draw_table(win, 1, 44, result, scroll)
-        else:
-            scroll = draw_table(win, after_summary, 2, result, scroll)
-        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  space toggle  pgup/pgdn table  m/← tools  esc/q quit", curses.A_DIM)
-        win.refresh()
-        key = win.getch()
-        if key == ord("q"):
-            return "quit"
-        if key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT):
-            return "menu"
-        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
-            cursor = (cursor + 1) % (TOGGLE + 1)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            cursor = (cursor - 1) % (TOGGLE + 1)
-        elif key == curses.KEY_NPAGE:
-            scroll += 5
-        elif key == curses.KEY_PPAGE:
-            scroll = max(0, scroll - 5)
-        elif cursor == TOGGLE and key == ord(" "):
-            pay_now = not pay_now
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            state[FIELDS[cursor][0]] = state[FIELDS[cursor][0]][:-1]
-        elif cursor != TOGGLE and 0 <= key < 256 and chr(key) in "0123456789.":
-            name = FIELDS[cursor][0]
-            if name == "monthly":
-                state["annual"] = ""
-            elif name == "annual":
-                state["monthly"] = ""
-            state[name] += chr(key)
-
+# --------------------------------------------------------------------------
+# Bond & note yield
+# --------------------------------------------------------------------------
 
 def parse_maturity(value: str) -> date | None:
     try:
@@ -275,104 +394,56 @@ def bond_result(state: dict[str, str], frequency: str, today: date):
         return None, str(error)
 
 
-def draw_bond_form(win, state: dict[str, str], cursor: int, frequency: str) -> int:
-    put(win, 0, 2, "incalc · bond & note yield", curses.color_pair(1) | curses.A_BOLD)
-    for index, (key, label) in enumerate(BOND_FIELDS):
-        y, value = 2 + index, state[key]
-        put(win, y, 2, label.rjust(11), curses.A_DIM)
-        shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
-        if index == cursor:
-            shown, attr = (value or " ") + " ", curses.A_REVERSE
-        put(win, y, 15, f" {shown} ", attr)
-    y = 2 + BOND_FREQUENCY
-    put(win, y, 2, "coupons".rjust(11), curses.A_DIM)
-    label = f"{frequency}  (space to change)"
-    put(win, y, 15, f" {label} ", curses.A_REVERSE if cursor == BOND_FREQUENCY else curses.A_NORMAL)
-    return y + 2
+class BondForm(Form):
+    title = "bond & note yield"
+    fields = (Field("nominal", "nominal"), Field("dirty_price", "dirty price"),
+              Field("days", "days left", DIGITS), Field("maturity", "maturity", DATE),
+              Field("coupon_rate", "coupon %"), Field("annual_rate", "annual %"))
+    toggle_label = "coupons"
+    toggle_hint = "coupon"
+    table_x = 48
+    frequencies = tuple(bond_yield.FREQUENCIES)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.frequency = "annual"
+        self.rate_source = "annual_rate"
+        self.today = date.today()
+
+    def evaluate(self):
+        return bond_result(self.state, self.frequency, self.today)
+
+    def toggle_text(self) -> str:
+        return f"{self.frequency}  (space to change)"
+
+    def on_toggle(self) -> None:
+        index = self.frequencies.index(self.frequency)
+        self.frequency = self.frequencies[(index + 1) % len(self.frequencies)]
+        if self.state[self.rate_source].strip():
+            sync_coupon_rates(self.state, self.rate_source, self.frequency)
+
+    def on_edit(self, key: str, typed: str | None) -> None:
+        if key in ("days", "maturity"):
+            sync_maturity_fields(self.state, key, self.today)
+        elif key in ("coupon_rate", "annual_rate"):
+            self.rate_source = key
+            sync_coupon_rates(self.state, key, self.frequency)
+
+    def summary(self, result) -> list[Line]:
+        return [Line("total cost", money(result.total_cost)), Line("coupons", money(result.total_coupons)),
+                Line("principal", money(result.principal_at_maturity)),
+                Line("total gain", money(result.total_gain)),
+                Line("compound yield", f"{result.ytm:.2f}%", curses.A_BOLD)]
+
+    def table(self, result) -> Table:
+        rows = [f"{flow.payment_date.strftime('%d-%m-%Y'):>12}{money(flow.coupon):>13}"
+                f"{money(flow.principal):>13}{money(flow.total):>13}" for flow in result.cash_flows]
+        return Table(f"{'date':>12}{'coupon':>13}{'principal':>13}{'total':>13}", rows)
 
 
-def draw_bond_summary(win, y: int, result, missing: str | None) -> int:
-    if missing:
-        put(win, y, 2, f"needs {missing}", curses.A_DIM)
-        return y + 2
-    lines = (("total cost", money(result.total_cost)), ("coupons", money(result.total_coupons)),
-             ("principal", money(result.principal_at_maturity)), ("total gain", money(result.total_gain)),
-             ("compound yield", f"{result.ytm:.2f}%"))
-    for index, (label, value) in enumerate(lines):
-        put(win, y + index, 2, label.rjust(13), curses.A_DIM)
-        put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label == "compound yield" else 0)
-    return y + len(lines) + 1
-
-
-def draw_bond_table(win, top: int, left: int, result, scroll: int) -> int:
-    if result is None:
-        return 0
-    head = f"{'date':>12}{'coupon':>13}{'principal':>13}{'total':>13}"
-    room = win.getmaxyx()[0] - top - 2
-    if room < 3:
-        return 0
-    body = max(1, room - 2)
-    scroll = max(0, min(scroll, len(result.cash_flows) - body))
-    put(win, top, left, head, curses.A_DIM)
-    put(win, top + 1, left, "-" * len(head), curses.A_DIM)
-    for index, flow in enumerate(result.cash_flows[scroll:scroll + body]):
-        line = f"{flow.payment_date.strftime('%d-%m-%Y'):>12}{money(flow.coupon):>13}{money(flow.principal):>13}{money(flow.total):>13}"
-        put(win, top + index + 2, left, line)
-    return scroll
-
-
-def bond_calculator(win) -> str:
-    state = {key: "" for key, _ in BOND_FIELDS}
-    cursor, scroll, frequency = 0, 0, "annual"
-    rate_source = "annual_rate"
-    today = date.today()
-    while True:
-        result, missing = bond_result(state, frequency, today)
-        win.erase()
-        after_form = draw_bond_form(win, state, cursor, frequency)
-        after_summary = draw_bond_summary(win, after_form, result, missing)
-        if win.getmaxyx()[1] >= 98:
-            scroll = draw_bond_table(win, 1, 48, result, scroll)
-        else:
-            scroll = draw_bond_table(win, after_summary, 2, result, scroll)
-        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  space coupon  pgup/pgdn table  m/← tools  esc/q quit", curses.A_DIM)
-        win.refresh()
-        key = win.getch()
-        if key == ord("q") or key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT):
-            return "menu"
-        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
-            cursor = (cursor + 1) % (BOND_FREQUENCY + 1)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            cursor = (cursor - 1) % (BOND_FREQUENCY + 1)
-        elif key == curses.KEY_NPAGE:
-            scroll += 5
-        elif key == curses.KEY_PPAGE:
-            scroll = max(0, scroll - 5)
-        elif cursor == BOND_FREQUENCY and key == ord(" "):
-            frequency = BOND_FREQUENCY_OPTIONS[(BOND_FREQUENCY_OPTIONS.index(frequency) + 1) % len(BOND_FREQUENCY_OPTIONS)]
-            if state[rate_source].strip():
-                sync_coupon_rates(state, rate_source, frequency)
-        elif cursor != BOND_FREQUENCY and key in (curses.KEY_BACKSPACE, 127, 8):
-            state[BOND_FIELDS[cursor][0]] = state[BOND_FIELDS[cursor][0]][:-1]
-            name = BOND_FIELDS[cursor][0]
-            if name in ("days", "maturity"):
-                sync_maturity_fields(state, name, today)
-            elif name in ("coupon_rate", "annual_rate"):
-                rate_source = name
-                sync_coupon_rates(state, name, frequency)
-        elif cursor != BOND_FREQUENCY and 0 <= key < 256 and chr(key) in "0123456789.-":
-            name = BOND_FIELDS[cursor][0]
-            allowed = "0123456789" if name == "days" else "0123456789.-"
-            if chr(key) in allowed:
-                state[name] += chr(key)
-                if name in ("days", "maturity"):
-                    sync_maturity_fields(state, name, today)
-                elif name in ("coupon_rate", "annual_rate"):
-                    rate_source = name
-                    sync_coupon_rates(state, name, frequency)
-
+# --------------------------------------------------------------------------
+# Real return
+# --------------------------------------------------------------------------
 
 def real_return_result(state: dict[str, str]):
     nominal = as_number(state["nominal"])
@@ -390,49 +461,25 @@ def real_return_result(state: dict[str, str]):
         return None, str(error)
 
 
-def real_return_calculator(win) -> str:
-    state = {key: "" for key, _ in REAL_RETURN_FIELDS}
-    cursor = 0
-    while True:
-        result, missing = real_return_result(state)
-        win.erase()
-        put(win, 0, 2, "incalc · real return", curses.color_pair(1) | curses.A_BOLD)
-        for index, (key, label) in enumerate(REAL_RETURN_FIELDS):
-            y, value = 2 + index, state[key]
-            put(win, y, 2, label.rjust(11), curses.A_DIM)
-            if not value and key == "tax":
-                shown, attr = "0", curses.A_DIM
-            else:
-                shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
-            if index == cursor:
-                shown, attr = (value or " ") + " ", curses.A_REVERSE
-            put(win, y, 15, f" {shown} ", attr)
-        y = 2 + len(REAL_RETURN_FIELDS) + 1
-        if missing:
-            put(win, y, 2, f"needs {missing}", curses.A_DIM)
-        else:
-            put(win, y, 2, "net nominal".rjust(13), curses.A_DIM)
-            put(win, y, 16, f"{result.net_nominal_return:.2f}%".rjust(13))
-            put(win, y + 1, 2, "real return".rjust(13), curses.A_DIM)
-            put(win, y + 1, 16, f"{result.real_return:.2f}%".rjust(13), curses.A_BOLD)
-            outcome = "purchasing power increased" if result.real_return > 0 else "purchasing power decreased" if result.real_return < 0 else "purchasing power unchanged"
-            put(win, y + 3, 2, outcome, curses.color_pair(1) if result.real_return >= 0 else curses.color_pair(2))
-        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  m/← tools  esc/q quit", curses.A_DIM)
-        win.refresh()
-        key = win.getch()
-        if key == ord("q") or key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT):
-            return "menu"
-        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
-            cursor = (cursor + 1) % len(REAL_RETURN_FIELDS)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            cursor = (cursor - 1) % len(REAL_RETURN_FIELDS)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            state[REAL_RETURN_FIELDS[cursor][0]] = state[REAL_RETURN_FIELDS[cursor][0]][:-1]
-        elif 0 <= key < 256 and chr(key) in "0123456789.-":
-            state[REAL_RETURN_FIELDS[cursor][0]] += chr(key)
+class RealReturnForm(Form):
+    title = "real return"
+    fields = (Field("nominal", "nominal %", SIGNED), Field("inflation", "inflation %", SIGNED),
+              Field("tax", "tax %", NUMBER, placeholder="0"))
 
+    def evaluate(self):
+        return real_return_result(self.state)
+
+    def summary(self, result) -> list[Line]:
+        real = result.real_return
+        outcome = "increased" if real > 0 else "decreased" if real < 0 else "unchanged"
+        return [Line("net nominal", f"{result.net_nominal_return:.2f}%"),
+                Line("real return", f"{real:.2f}%", curses.A_BOLD), Line(),
+                Line(value=f"purchasing power {outcome}", attr=accent() if real >= 0 else warning(), note=True)]
+
+
+# --------------------------------------------------------------------------
+# Term deposit
+# --------------------------------------------------------------------------
 
 def term_deposit_result(state: dict[str, str]):
     principal = as_number(state["principal"])
@@ -450,53 +497,34 @@ def term_deposit_result(state: dict[str, str]):
         return None, str(error)
 
 
-def term_deposit_calculator(win) -> str:
-    state = {key: "" for key, _ in TERM_DEPOSIT_FIELDS}
-    cursor = 0
-    while True:
-        result, missing = term_deposit_result(state)
-        win.erase()
-        put(win, 0, 2, "incalc · term deposit interest", curses.color_pair(1) | curses.A_BOLD)
-        for index, (key, label) in enumerate(TERM_DEPOSIT_FIELDS):
-            y, value = 2 + index, state[key]
-            put(win, y, 2, label.rjust(11), curses.A_DIM)
-            shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
-            if index == cursor:
-                shown, attr = (value or " ") + " ", curses.A_REVERSE
-            put(win, y, 15, f" {shown} ", attr)
-        y = 7
-        if missing:
-            put(win, y, 2, f"needs {missing}", curses.A_DIM)
-        else:
-            lines = (("gross interest", money(result.gross_interest)), (f"tax ({result.withholding_rate:g}%)", "-" + money(result.withholding)),
-                     ("net interest", money(result.net_interest)), ("at maturity", money(result.maturity_balance)))
-            for index, (label, value) in enumerate(lines):
-                put(win, y + index, 2, label.rjust(13), curses.A_DIM)
-                put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label == "at maturity" else 0)
-            table_y = y + len(lines) + 2
-            put(win, table_y, 2, "comparison — same annual rate", curses.A_DIM)
-            head = f"{'days':>6}{'tax':>8}{'net interest':>16}{'at maturity':>16}"
-            put(win, table_y + 1, 2, head, curses.A_DIM)
-            for index, term in enumerate(term_deposit.COMPARISON_TERMS):
-                comparison = term_deposit.calculate(principal=as_number(state["principal"]), annual_rate=as_number(state["annual_rate"]), days=term)
-                line = f"{term:>6}{comparison.withholding_rate:>7g}%{money(comparison.net_interest):>16}{money(comparison.maturity_balance):>16}"
-                put(win, table_y + 2 + index, 2, line)
-        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  m/← tools  esc/q quit", curses.A_DIM)
-        win.refresh()
-        key = win.getch()
-        if key == ord("q") or key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT):
-            return "menu"
-        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
-            cursor = (cursor + 1) % len(TERM_DEPOSIT_FIELDS)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            cursor = (cursor - 1) % len(TERM_DEPOSIT_FIELDS)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            state[TERM_DEPOSIT_FIELDS[cursor][0]] = state[TERM_DEPOSIT_FIELDS[cursor][0]][:-1]
-        elif 0 <= key < 256 and chr(key) in "0123456789.":
-            state[TERM_DEPOSIT_FIELDS[cursor][0]] += chr(key)
+class TermDepositForm(Form):
+    title = "term deposit interest"
+    fields = (Field("principal", "principal"), Field("annual_rate", "annual %"),
+              Field("days", "term days", DIGITS))
 
+    def evaluate(self):
+        return term_deposit_result(self.state)
+
+    def summary(self, result) -> list[Line]:
+        return [Line("gross interest", money(result.gross_interest)),
+                Line(f"tax ({result.withholding_rate:g}%)", "-" + money(result.withholding)),
+                Line("net interest", money(result.net_interest)),
+                Line("at maturity", money(result.maturity_balance), curses.A_BOLD)]
+
+    def table(self, result) -> Table:
+        principal, rate = float(self.state["principal"]), float(self.state["annual_rate"])
+        rows = []
+        for term in term_deposit.COMPARISON_TERMS:
+            item = term_deposit.calculate(principal=principal, annual_rate=rate, days=term)
+            rows.append(f"{term:>6}{item.withholding_rate:>7g}%{money(item.net_interest):>16}"
+                        f"{money(item.maturity_balance):>16}")
+        return Table(f"{'days':>6}{'tax':>8}{'net interest':>16}{'at maturity':>16}", rows,
+                     "comparison — same annual rate")
+
+
+# --------------------------------------------------------------------------
+# Profit margin
+# --------------------------------------------------------------------------
 
 def profit_margin_result(state: dict[str, str]):
     cost = as_number(state["cost"])
@@ -514,46 +542,23 @@ def profit_margin_result(state: dict[str, str]):
         return None, str(error)
 
 
-def profit_margin_calculator(win) -> str:
-    state = {key: "" for key, _ in PROFIT_MARGIN_FIELDS}
-    cursor = 0
-    while True:
-        result, missing = profit_margin_result(state)
-        win.erase()
-        put(win, 0, 2, "incalc · profit margin", curses.color_pair(1) | curses.A_BOLD)
-        for index, (key, label) in enumerate(PROFIT_MARGIN_FIELDS):
-            y, value = 2 + index, state[key]
-            put(win, y, 2, label.rjust(11), curses.A_DIM)
-            shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
-            if index == cursor:
-                shown, attr = (value or " ") + " ", curses.A_REVERSE
-            put(win, y, 15, f" {shown} ", attr)
-        y = 7
-        if missing:
-            put(win, y, 2, f"needs {missing}", curses.A_DIM)
-        else:
-            lines = (("unit profit", money(result.unit_profit)), ("total cost", money(result.total_cost)),
-                     ("revenue", money(result.total_revenue)), ("total profit", money(result.total_profit)),
-                     ("profit margin", f"{result.profit_margin:.2f}%"), ("markup", f"{result.markup:.2f}%"))
-            for index, (label, value) in enumerate(lines):
-                put(win, y + index, 2, label.rjust(13), curses.A_DIM)
-                put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label in ("profit margin", "markup") else 0)
-        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  m/← tools  esc/q quit", curses.A_DIM)
-        win.refresh()
-        key = win.getch()
-        if key == ord("q") or key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT):
-            return "menu"
-        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
-            cursor = (cursor + 1) % len(PROFIT_MARGIN_FIELDS)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            cursor = (cursor - 1) % len(PROFIT_MARGIN_FIELDS)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            state[PROFIT_MARGIN_FIELDS[cursor][0]] = state[PROFIT_MARGIN_FIELDS[cursor][0]][:-1]
-        elif 0 <= key < 256 and chr(key) in "0123456789.-":
-            state[PROFIT_MARGIN_FIELDS[cursor][0]] += chr(key)
+class ProfitMarginForm(Form):
+    title = "profit margin"
+    fields = (Field("cost", "unit cost"), Field("price", "sale price"), Field("quantity", "quantity"))
 
+    def evaluate(self):
+        return profit_margin_result(self.state)
+
+    def summary(self, result) -> list[Line]:
+        return [Line("unit profit", money(result.unit_profit)), Line("total cost", money(result.total_cost)),
+                Line("revenue", money(result.total_revenue)), Line("total profit", money(result.total_profit)),
+                Line("profit margin", f"{result.profit_margin:.2f}%", curses.A_BOLD),
+                Line("markup", f"{result.markup:.2f}%", curses.A_BOLD)]
+
+
+# --------------------------------------------------------------------------
+# Weighted averages
+# --------------------------------------------------------------------------
 
 def average_entries(rows: list[dict[str, str]], left: str, right: str):
     entries: list[tuple[float, float]] = []
@@ -570,90 +575,88 @@ def average_entries(rows: list[dict[str, str]], left: str, right: str):
     return entries, None
 
 
-def weighted_average_calculator(win, *, title: str, left: str, right: str, calculate) -> str:
-    rows = [{left: "", right: ""}]
-    cursor, top_row = 0, 0
-    while True:
-        entries, missing = average_entries(rows, left, right)
-        if entries is not None:
-            try:
-                result, missing = calculate(entries), None
-            except ValueError as error:
-                result, missing = None, str(error)
-        else:
-            result = None
-        win.erase()
-        put(win, 0, 2, f"incalc · {title}", curses.color_pair(1) | curses.A_BOLD)
-        current_row = cursor // 2
-        visible_rows = max(1, (win.getmaxyx()[0] - 10) // 2)
-        if current_row < top_row:
-            top_row = current_row
-        elif current_row >= top_row + visible_rows:
-            top_row = current_row - visible_rows + 1
-        for row_index in range(top_row, min(len(rows), top_row + visible_rows)):
-            y = 2 + (row_index - top_row) * 2
-            for side, key in enumerate((left, right)):
-                value = rows[row_index][key]
-                put(win, y + side, 2, f"{key} {row_index + 1}".rjust(11), curses.A_DIM)
-                shown, attr = (value or "-"), (curses.A_NORMAL if value else curses.A_DIM)
-                if cursor == row_index * 2 + side:
-                    shown, attr = (value or " ") + " ", curses.A_REVERSE
-                put(win, y + side, 15, f" {shown} ", attr)
-        y = 2 + min(visible_rows, len(rows) - top_row) * 2 + 1
-        if top_row:
-            put(win, 1, 45, f"entries {top_row + 1}-{min(len(rows), top_row + visible_rows)}", curses.A_DIM)
-        if missing:
-            put(win, y, 2, f"needs {missing}", curses.A_DIM)
-        elif title == "average cost":
-            lines = (("total quantity", money(result.total_quantity)), ("total cost", money(result.total_cost)),
-                     ("average cost", money(result.average_cost)))
-            for index, (label, value) in enumerate(lines):
-                put(win, y + index, 2, label.rjust(13), curses.A_DIM)
-                put(win, y + index, 16, value.rjust(13), curses.A_BOLD if label == "average cost" else 0)
-        else:
-            put(win, y, 2, "total amount".rjust(13), curses.A_DIM)
-            put(win, y, 16, money(result.total_amount).rjust(13))
-            put(win, y + 1, 2, "average days".rjust(13), curses.A_DIM)
-            put(win, y + 1, 16, f"{result.average_days:.2f}".rjust(13), curses.A_BOLD)
-        put(win, win.getmaxyx()[0] - 1, 2, "↑/↓ field  new row opens automatically  m/← tools  esc/q quit", curses.A_DIM)
-        win.refresh()
-        key = win.getch()
-        if key == ord("q") or key == 27:
-            return "quit"
-        if key in (ord("m"), curses.KEY_LEFT):
-            return "menu"
-        if key in (curses.KEY_DOWN, ord("\t"), ord("\n")):
-            cursor = (cursor + 1) % (len(rows) * 2)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            cursor = (cursor - 1) % (len(rows) * 2)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            row, key_name = rows[cursor // 2], (left, right)[cursor % 2]
-            row[key_name] = row[key_name][:-1]
-        elif 0 <= key < 256 and chr(key) in "0123456789.":
-            row, key_name = rows[cursor // 2], (left, right)[cursor % 2]
-            row[key_name] += chr(key)
-            if rows[-1][left] and rows[-1][right]:
-                rows.append({left: "", right: ""})
+class WeightedAverageForm(Form):
+    """A growing list of value pairs; a blank pair opens when the last one is filled."""
+    left = right = ""
+    hint = "new row opens automatically"
+
+    def __init__(self) -> None:
+        self.count = 1
+        super().__init__()
+
+    def visible_fields(self) -> tuple[Field, ...]:
+        return tuple(Field(f"{side}:{row}", f"{side} {row + 1}")
+                     for row in range(self.count) for side in (self.left, self.right))
+
+    def rows(self) -> list[dict[str, str]]:
+        return [{side: self.state[f"{side}:{row}"] for side in (self.left, self.right)}
+                for row in range(self.count)]
+
+    def on_edit(self, key: str, typed: str | None) -> None:
+        last = self.count - 1
+        if typed is not None and self.state[f"{self.left}:{last}"] and self.state[f"{self.right}:{last}"]:
+            self.state[f"{self.left}:{self.count}"] = self.state[f"{self.right}:{self.count}"] = ""
+            self.count += 1
+
+    def calculate(self, entries):
+        raise NotImplementedError
+
+    def evaluate(self):
+        entries, missing = average_entries(self.rows(), self.left, self.right)
+        if entries is None:
+            return None, missing
+        try:
+            return self.calculate(entries), None
+        except ValueError as error:
+            return None, str(error)
 
 
-def average_cost_calculator(win) -> str:
-    return weighted_average_calculator(win, title="average cost", left="quantity", right="price",
-                                       calculate=weighted_average.average_cost)
+class AverageCostForm(WeightedAverageForm):
+    title, left, right = "average cost", "quantity", "price"
+
+    def calculate(self, entries):
+        return weighted_average.average_cost(entries)
+
+    def summary(self, result) -> list[Line]:
+        return [Line("total quantity", money(result.total_quantity)), Line("total cost", money(result.total_cost)),
+                Line("average cost", money(result.average_cost), curses.A_BOLD)]
 
 
-def average_maturity_calculator(win) -> str:
-    return weighted_average_calculator(win, title="average maturity", left="amount", right="days",
-                                       calculate=weighted_average.average_maturity)
+class AverageMaturityForm(WeightedAverageForm):
+    title, left, right = "average maturity", "amount", "days"
+
+    def calculate(self, entries):
+        return weighted_average.average_maturity(entries)
+
+    def summary(self, result) -> list[Line]:
+        return [Line("total amount", money(result.total_amount)),
+                Line("average days", f"{result.average_days:.2f}", curses.A_BOLD)]
+
+
+# --------------------------------------------------------------------------
+# Tool menu and entry point
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Tool:
+    flag: str
+    label: str
+    category: str
+    description: str
+    form: Callable[[], Form]
+
+    def run(self, win) -> str:
+        return run_form(win, self.form())
 
 
 TOOLS = (
-    Tool("yield", "Installment yield", "Savings & Returns", "Interest-free installments and fund return", calculator),
-    Tool("real-return", "Real Return", "Savings & Returns", "After-tax return adjusted for inflation", real_return_calculator),
-    Tool("term-deposit", "Term Deposit Interest", "Savings & Returns", "Net interest and maturity comparison", term_deposit_calculator),
-    Tool("bond-yield", "Bond & Note Yield", "Bonds & Securities", "Cash flows and compound yield", bond_calculator),
-    Tool("profit-margin", "Profit Margin", "Business", "Compare margin and markup from cost and sale price", profit_margin_calculator),
-    Tool("average-cost", "Average Cost", "Portfolio", "", average_cost_calculator),
-    Tool("average-maturity", "Average Maturity", "Portfolio", "", average_maturity_calculator),
+    Tool("yield", "Installment yield", "Savings & Returns", "Interest-free installments and fund return", InstallmentForm),
+    Tool("real-return", "Real Return", "Savings & Returns", "After-tax return adjusted for inflation", RealReturnForm),
+    Tool("term-deposit", "Term Deposit Interest", "Savings & Returns", "Net interest and maturity comparison", TermDepositForm),
+    Tool("bond-yield", "Bond & Note Yield", "Bonds & Securities", "Cash flows and compound yield", BondForm),
+    Tool("profit-margin", "Profit Margin", "Business", "Compare margin and markup from cost and sale price", ProfitMarginForm),
+    Tool("average-cost", "Average Cost", "Portfolio", "Quantity-weighted purchase price", AverageCostForm),
+    Tool("average-maturity", "Average Maturity", "Portfolio", "Amount-weighted remaining days", AverageMaturityForm),
 )
 
 
@@ -671,7 +674,7 @@ def tools_menu(win, selected_tool: str | None = None) -> str | None:
         visible_tools = search_tools(query)
         cursor = min(cursor, max(0, len(visible_tools) - 1))
         win.erase()
-        put(win, 1, 2, "incalc · tools", curses.color_pair(1) | curses.A_BOLD)
+        put(win, 1, 2, "incalc · tools", accent() | curses.A_BOLD)
         put(win, 3, 2, f" search: {query or 'type to filter'} ", curses.A_REVERSE if query else curses.A_DIM)
         y = 5
         for category in dict.fromkeys(tool.category for tool in visible_tools):
@@ -680,9 +683,8 @@ def tools_menu(win, selected_tool: str | None = None) -> str | None:
             for tool in (item for item in visible_tools if item.category == category):
                 index = visible_tools.index(tool)
                 attr = curses.A_REVERSE if index == cursor else curses.A_NORMAL
-                text = tool.label if not tool.description else f"{tool.label:<22} {tool.description}"
-                put(win, y, 4, text, attr)
                 put(win, y, 2, "›" if index == cursor else " ", attr)
+                put(win, y, 4, f"{tool.label:<22} {tool.description}", attr)
                 y += 1
             y += 1
         if not visible_tools:
@@ -690,18 +692,16 @@ def tools_menu(win, selected_tool: str | None = None) -> str | None:
         put(win, win.getmaxyx()[0] - 1, 2, "type search  ctrl+u clear  ↑/↓ select  enter/→ open  esc/q quit", curses.A_DIM)
         win.refresh()
         key = win.getch()
-        if key in (ord("q"), 27):
+        if key in QUIT_KEYS:
             return None
         if key == 21:  # Ctrl+U
-            query = ""
-            cursor = 0
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            query = query[:-1]
-            cursor = 0
-        if key in (curses.KEY_DOWN, ord("\t")):
+            query, cursor = "", 0
+        elif key in BACKSPACE_KEYS:
+            query, cursor = query[:-1], 0
+        elif key in (curses.KEY_DOWN, ord("\t")):
             if visible_tools:
                 cursor = (cursor + 1) % len(visible_tools)
-        elif key in (curses.KEY_UP, curses.KEY_BTAB):
+        elif key in PREV_KEYS:
             if visible_tools:
                 cursor = (cursor - 1) % len(visible_tools)
         elif key in (curses.KEY_ENTER, curses.KEY_RIGHT, ord("\n")):
@@ -712,45 +712,53 @@ def tools_menu(win, selected_tool: str | None = None) -> str | None:
             cursor = 0
 
 
+def prepare_terminal(win) -> None:
+    # Translate terminal escape sequences (such as arrows) into KEY_* codes.
+    # Without this, an Up arrow can be read as a bare Escape on some terminals.
+    win.keypad(True)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+    for pair, colour in ((1, curses.COLOR_CYAN), (2, curses.COLOR_RED)):
+        try:
+            curses.init_pair(pair, colour, -1)
+        except curses.error:
+            pass
+
+
 def run(win, initial_tool: str | None) -> None:
     prepare_terminal(win)
     tools = {tool.flag: tool for tool in TOOLS}
-    selected = initial_tool
-    last_selected = initial_tool
+    selected = last_selected = initial_tool
     while True:
         if selected is None:
             selected = tools_menu(win, last_selected)
             if selected is None:
                 return
         last_selected = selected
-        outcome = tools[selected].run(win)
-        if outcome == "quit":
+        if tools[selected].run(win) == "quit":
             return
         selected = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="incalc", description="Keyboard-first terminal calculator toolbox")
-    tool = parser.add_mutually_exclusive_group()
-    tool.add_argument("--yield", dest="tool", action="store_const", const="yield",
-                      help="open installment yield directly")
-    tool.add_argument("--bond-yield", dest="tool", action="store_const", const="bond-yield",
-                      help="open bond and note yield directly")
-    tool.add_argument("--real-return", dest="tool", action="store_const", const="real-return",
-                      help="open real return directly")
-    tool.add_argument("--term-deposit", dest="tool", action="store_const", const="term-deposit",
-                      help="open term deposit interest directly")
-    tool.add_argument("--profit-margin", dest="tool", action="store_const", const="profit-margin",
-                      help="open profit margin directly")
-    tool.add_argument("--average-cost", dest="tool", action="store_const", const="average-cost",
-                      help="open average cost directly")
-    tool.add_argument("--average-maturity", dest="tool", action="store_const", const="average-maturity",
-                      help="open average maturity directly")
+    group = parser.add_mutually_exclusive_group()
+    for tool in TOOLS:
+        group.add_argument(f"--{tool.flag}", dest="tool", action="store_const", const=tool.flag,
+                           help=f"open {tool.label.lower()} directly")
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # curses waits a full second after Escape by default to detect key sequences.
+    os.environ.setdefault("ESCDELAY", "25")
     locale.setlocale(locale.LC_ALL, "")
     try:
         curses.wrapper(run, args.tool)

@@ -51,9 +51,9 @@ your purchasing power increased or decreased.
 
 ## Bond & Note Yield
 
-Enter the nominal amount and dirty purchase price. A three-digit quote (such
-as `100.50`) is treated as a price per 100 nominal; a smaller quote (such as
-`1.005`) is treated as a price per one nominal. Then enter either a
+Enter the nominal amount and dirty purchase price. A quote of 10 or more (such
+as `100.50` or `85.40`) is treated as a price per 100 nominal; a smaller quote
+(such as `1.005` or `0.854`) is treated as a price per one nominal. Then enter either a
 per-payment coupon rate or annual coupon rate; the other rate is filled from
 the selected coupon frequency. Also enter either remaining days or a
 `DD-MM-YYYY` maturity date. The other maturity field is filled from today's
@@ -67,10 +67,14 @@ fields, Space toggles the first-payment timing, and Page Up/Page Down scroll
 the table. Enter or Right opens a selected tool; `m` or Left returns to the
 tool menu; Escape or `q` exits. On narrow
 terminals the table moves below the form instead of being compressed beside it.
-On Windows, install `windows-curses` alongside the app.
+On Windows, `windows-curses` is installed automatically as a dependency.
 
-## First tool: Installment yield
+## Installment yield
 
 Enter a price, number of installments, and either a monthly or annual fund
 return. The calculator shows the installment schedule, fund balance, tax, and
 effective discount. “First payment now” switches the timing convention.
+
+## License
+
+[MIT](LICENSE).

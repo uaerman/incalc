@@ -63,9 +63,9 @@ def calculate(
     if maturity <= settlement:
         raise ValueError("maturity must be after settlement")
 
-    # Three-digit quotes (for example 100.50) are prices per 100 nominal.
-    # Smaller quotes (for example 1.005) are already per one nominal.
-    unit_price = dirty_price / 100 if 100 <= dirty_price < 1_000 else dirty_price
+    # Quotes of 10 or more (for example 100.50 or 85.40) are prices per 100
+    # nominal. Smaller quotes (for example 1.005 or 0.854) are per one nominal.
+    unit_price = dirty_price / 100 if dirty_price >= 10 else dirty_price
     total_cost = nominal * unit_price
     period_coupon = nominal * coupon_rate / 100 / frequency
     dates = coupon_dates(settlement, maturity, frequency)

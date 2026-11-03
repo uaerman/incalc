@@ -31,6 +31,19 @@ class BondYieldTests(unittest.TestCase):
         self.assertAlmostEqual(quoted_per_hundred.total_cost, 100.5)
         self.assertAlmostEqual(quoted_per_nominal.total_cost, 100.5)
 
+    def test_below_par_quotes_are_per_hundred_nominal(self):
+        result = calculate(
+            nominal=1000, dirty_price=85.4, maturity=date(2027, 1, 1),
+            coupon_rate=0, frequency=1, settlement=date(2026, 1, 1),
+        )
+        self.assertAlmostEqual(result.total_cost, 854)
+        self.assertAlmostEqual(result.ytm, 1000 / 854 * 100 - 100, places=6)
+        per_nominal = calculate(
+            nominal=1000, dirty_price=0.854, maturity=date(2027, 1, 1),
+            coupon_rate=0, frequency=1, settlement=date(2026, 1, 1),
+        )
+        self.assertAlmostEqual(per_nominal.total_cost, 854)
+
     def test_semiannual_coupon_dates_are_generated_back_from_maturity(self):
         dates = coupon_dates(date(2026, 1, 1), date(2027, 1, 1), 2)
         self.assertEqual(dates, [date(2026, 7, 1), date(2027, 1, 1)])

@@ -9,7 +9,7 @@ description = "A terminal toolbox for personal calculations"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
+dependencies = ["windows-curses; sys_platform == 'win32'"]
 
 [project.scripts]
 incalc = "incalc.app:main"
